@@ -416,7 +416,7 @@ local KillAuraToggle
 local StoryToggle
 
 KillAuraToggle = MainTab:CreateToggle({
-   Name = "Kill Aura",
+   Name = "OLHAR ME MIL JARDAS DO ANJO CAÍDO (Kill Aura)",
    CurrentValue = false,
    Flag = "KillAuraFlag",
    Callback = function(Value)
