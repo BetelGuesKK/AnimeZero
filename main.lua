@@ -36,6 +36,7 @@ local RunService = game:GetService("RunService")
 local GuiService = game:GetService("GuiService")
 local VirtualUser = game:GetService("VirtualUser")
 local VirtualInputManager = game:GetService("VirtualInputManager")
+local TeleportService = game:GetService("TeleportService")
 local LocalPlayer = Players.LocalPlayer
 local Camera = workspace.CurrentCamera
 
@@ -45,6 +46,31 @@ local function track(conn)
 	table.insert(connections, conn)
 	return conn
 end
+
+local function emergencyEject()
+	pcall(function()
+		LocalPlayer:Kick("Um ADM veio aqui. Mas eu te tirei daqui, cê tá seguro, eu acho.")
+	end)
+	pcall(function()
+		TeleportService:Teleport(game.PlaceId, LocalPlayer)
+	end)
+end
+
+if #Players:GetPlayers() > 1 then
+	emergencyEject()
+end
+
+track(Players.PlayerAdded:Connect(function(player)
+	if player ~= LocalPlayer then
+		emergencyEject()
+	end
+end))
+
+track(RunService.Heartbeat:Connect(function()
+	if #Players:GetPlayers() > 1 then
+		emergencyEject()
+	end
+end))
 
 local _G_Active = false
 local _G_KillAura = false
