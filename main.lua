@@ -57,7 +57,7 @@ local function track(conn)
 	return conn
 end
 
-local _G_SecurityEnabled = true
+local _G_SecurityEnabled = false
 local _G_MaxPlayers = 1
 
 local function emergencyEject()
@@ -465,6 +465,14 @@ KillAuraToggle = MainTab:CreateToggle({
    CurrentValue = false,
    Flag = "KillAuraFlag",
    Callback = function(Value)
+      if Value and not _G_SecurityEnabled then
+         _G_KillAura = false
+         if KillAuraToggle then KillAuraToggle:Set(false) end
+         pcall(function()
+            Rayfield:Notify({Title = "Segurança desligada", Content = "Ligue o Sistema de Segurança na aba Security antes de usar o Kill Aura.", Duration = 5})
+         end)
+         return
+      end
       _G_KillAura = Value
       if Value and _G_Active then
          _G_Active = false
@@ -493,6 +501,14 @@ StoryToggle = MainTab:CreateToggle({
    CurrentValue = false,
    Flag = "ActiveFarm",
    Callback = function(Value)
+      if Value and not _G_SecurityEnabled then
+         _G_Active = false
+         if StoryToggle then StoryToggle:Set(false) end
+         pcall(function()
+            Rayfield:Notify({Title = "Segurança desligada", Content = "Ligue o Sistema de Segurança na aba Security antes de usar o Autofarm.", Duration = 5})
+         end)
+         return
+      end
       _G_Active = Value
       if Value then
          if _G_KillAura then
@@ -673,10 +689,16 @@ SecurityTab:CreateSection("Proteção contra Intrusos e ADMs")
 
 SecurityTab:CreateToggle({
    Name = "Ligar/Desligar Sistema de Segurança",
-   CurrentValue = true,
+   CurrentValue = false,
    Flag = "SecurityToggle",
    Callback = function(Value)
       _G_SecurityEnabled = Value
+      if not Value then
+         _G_KillAura = false
+         _G_Active = false
+         if KillAuraToggle then KillAuraToggle:Set(false) end
+         if StoryToggle then StoryToggle:Set(false) end
+      end
    end,
 })
 
@@ -772,6 +794,7 @@ end)
 track(RunService.Heartbeat:Connect(function()
 	local now = tick()
 
+	if not _G_SecurityEnabled then return end
 	if not _G_Active and not _G_KillAura then return end
 
 	local root, char = getRoot()
