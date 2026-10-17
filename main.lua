@@ -576,6 +576,7 @@ MainTab:CreateDropdown({
    CurrentOption = "ANAL (Atrás)",
    Flag = "ModeDropdown",
    Callback = function(Option)
+      if type(Option) == "table" then Option = Option[1] end
       if Option == "ORAL (em cima)" then
          _G_Mode = "acima"
       elseif Option == "ANAL (Atrás)" then
