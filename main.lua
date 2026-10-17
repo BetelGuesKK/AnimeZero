@@ -57,11 +57,25 @@ local function track(conn)
 	return conn
 end
 
+env.VovoNinjaCleanup = function()
+	running = false
+	for _, c in ipairs(connections) do
+		pcall(function() c:Disconnect() end)
+	end
+	table.clear(connections)
+end
+
 local _G_SecurityEnabled = false
 local _G_MaxPlayers = 1
+local ejecting = false
+
+local function overLimit()
+	return _G_SecurityEnabled and #Players:GetPlayers() > _G_MaxPlayers
+end
 
 local function emergencyEject()
-	if not _G_SecurityEnabled then return end
+	if not _G_SecurityEnabled or ejecting then return end
+	ejecting = true
 	pcall(function()
 		LocalPlayer:Kick("Um ADM veio aqui. Mas eu te tirei daqui, cê tá seguro, eu acho.")
 	end)
@@ -73,20 +87,14 @@ end
 task.spawn(function()
 	while running do
 		task.wait(0.1)
-		if _G_SecurityEnabled and #Players:GetPlayers() > _G_MaxPlayers then
+		if overLimit() then
 			emergencyEject()
 		end
 	end
 end)
 
 track(Players.PlayerAdded:Connect(function(player)
-	if _G_SecurityEnabled and #Players:GetPlayers() > _G_MaxPlayers then
-		emergencyEject()
-	end
-end))
-
-track(RunService.Heartbeat:Connect(function()
-	if _G_SecurityEnabled and #Players:GetPlayers() > _G_MaxPlayers then
+	if overLimit() then
 		emergencyEject()
 	end
 end))
@@ -703,12 +711,14 @@ SecurityTab:CreateToggle({
 })
 
 SecurityTab:CreateDropdown({
-   Name = "Máximo de Jogadores",
+   Name = "Máximo de Jogadores no servidor (contando você)",
    Options = {"1", "2", "3", "4", "5", "6"},
    CurrentOption = "1",
    Flag = "MaxPlayersDropdown",
    Callback = function(Option)
-      _G_MaxPlayers = tonumber(Option) or 1
+      local v = Option
+      if type(v) == "table" then v = v[1] end
+      _G_MaxPlayers = tonumber(v) or _G_MaxPlayers
    end,
 })
 
