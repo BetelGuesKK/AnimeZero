@@ -1,3 +1,12 @@
+pcall(function()
+	local ts = game:GetService("TeleportService")
+	if typeof(hookfunction) == "function" then
+		hookfunction(ts.Teleport, function() end)
+		hookfunction(ts.TeleportToPlaceInstance, function() end)
+		hookfunction(ts.TeleportAsync, function() end)
+	end
+end)
+
 local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
 
 local Window = Rayfield:CreateWindow({
@@ -14,6 +23,7 @@ local Window = Rayfield:CreateWindow({
 local MainTab = Window:CreateTab("Main", 4483362458)
 local TeleportsTab = Window:CreateTab("Teleports", 4483362458)
 local SkillsTab = Window:CreateTab("Skills", 4483362458)
+local SecurityTab = Window:CreateTab("Security", 4483362458)
 local DonateTab = Window:CreateTab("Donate", 4483362458)
 
 for _, gui in ipairs(game:GetService("CoreGui"):GetChildren()) do
@@ -47,7 +57,11 @@ local function track(conn)
 	return conn
 end
 
+local _G_SecurityEnabled = true
+local _G_MaxPlayers = 1
+
 local function emergencyEject()
+	if not _G_SecurityEnabled then return end
 	pcall(function()
 		LocalPlayer:Kick("Um ADM veio aqui. Mas eu te tirei daqui, cê tá seguro, eu acho.")
 	end)
@@ -56,18 +70,23 @@ local function emergencyEject()
 	end)
 end
 
-if #Players:GetPlayers() > 1 then
-	emergencyEject()
-end
+task.spawn(function()
+	while running do
+		task.wait(0.1)
+		if _G_SecurityEnabled and #Players:GetPlayers() > _G_MaxPlayers then
+			emergencyEject()
+		end
+	end
+end)
 
 track(Players.PlayerAdded:Connect(function(player)
-	if player ~= LocalPlayer then
+	if _G_SecurityEnabled and #Players:GetPlayers() > _G_MaxPlayers then
 		emergencyEject()
 	end
 end))
 
 track(RunService.Heartbeat:Connect(function()
-	if #Players:GetPlayers() > 1 then
+	if _G_SecurityEnabled and #Players:GetPlayers() > _G_MaxPlayers then
 		emergencyEject()
 	end
 end))
@@ -647,6 +666,27 @@ SkillsTab:CreateSlider({
    Flag = "TSlider",
    Callback = function(Value)
       _G_TInterval = Value
+   end,
+})
+
+SecurityTab:CreateSection("Proteção contra Intrusos e ADMs")
+
+SecurityTab:CreateToggle({
+   Name = "Ligar/Desligar Sistema de Segurança",
+   CurrentValue = true,
+   Flag = "SecurityToggle",
+   Callback = function(Value)
+      _G_SecurityEnabled = Value
+   end,
+})
+
+SecurityTab:CreateDropdown({
+   Name = "Máximo de Jogadores",
+   Options = {"1", "2", "3", "4", "5", "6"},
+   CurrentOption = "1",
+   Flag = "MaxPlayersDropdown",
+   Callback = function(Option)
+      _G_MaxPlayers = tonumber(Option) or 1
    end,
 })
 
