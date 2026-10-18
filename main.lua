@@ -28,12 +28,12 @@ local SecurityTab = Window:CreateTab("Security", 4483362458)
 local DonateTab = Window:CreateTab("Donate", 4483362458)
 
 for _, gui in ipairs(game:GetService("CoreGui"):GetChildren()) do
-	if gui.Name == "VovoNinjaStoryGui" or gui.Name == "FloatingDonateGui" or gui.Name == "UmamusumeHubGui" then gui:Destroy() end
+	if gui.Name == "VovoNinjaStoryGui" or gui.Name == "FloatingDonateGui" or gui.Name == "UmamusumeHubGui" or gui.Name == "ChisaHistoryGui" then gui:Destroy() end
 end
 local pGui = game:GetService("Players").LocalPlayer:FindFirstChild("PlayerGui")
 if pGui then
 	for _, gui in ipairs(pGui:GetChildren()) do
-		if gui.Name == "VovoNinjaStoryGui" or gui.Name == "FloatingDonateGui" or gui.Name == "UmamusumeHubGui" then gui:Destroy() end
+		if gui.Name == "VovoNinjaStoryGui" or gui.Name == "FloatingDonateGui" or gui.Name == "UmamusumeHubGui" or gui.Name == "ChisaHistoryGui" then gui:Destroy() end
 	end
 end
 
@@ -65,6 +65,17 @@ env.VovoNinjaCleanup = function()
 	end
 	table.clear(connections)
 end
+
+-- NOCLIP permanente (sempre ligado enquanto o script roda)
+track(RunService.Stepped:Connect(function()
+	local char = LocalPlayer.Character
+	if not char then return end
+	for _, part in ipairs(char:GetDescendants()) do
+		if part:IsA("BasePart") and part.CanCollide then
+			part.CanCollide = false
+		end
+	end
+end))
 
 local _G_SecurityEnabled = false
 local _G_MaxPlayers = 1
@@ -255,6 +266,291 @@ local function resetRun()
 	finishedTime = 0
 end
 
+-- ============================================================
+-- HISTÓRICO DE PARTIDAS (GUI flutuante) com várias camadas anti falso-positivo
+-- ============================================================
+local HData = env.ChisaHistory
+if type(HData) ~= "table" or type(HData.log) ~= "table" then
+	HData = {wins = 0, losses = 0, log = {}}
+	env.ChisaHistory = HData
+end
+
+local History = {
+	armed = false,        
+	matchStart = tick(),
+	died = false,
+	logged = false,       
+	endShownAt = nil,
+	sawRetry = false,
+	sawNext = false,
+	aliveAtEnd = false,
+	defeatText = false,
+	victoryText = false,
+	retryClicked = false,
+	requireConfirm = false,
+	lastRejected = nil,
+	MIN_MATCH = 20,       -- partida precisa ter durado pelo menos X s
+	MIN_END_VISIBLE = 1.5,-- tela final precisa ficar visível pelo menos X s
+}
+
+local DEFEAT_WORDS = {"defeat", "derrota", "you died", "game over", "failed", "you lose", "você morreu", "voce morreu", "perdeu", "fracasso"}
+local VICTORY_WORDS = {"victory", "vitória", "vitoria", "cleared", "completed", "success", "you win", "concluíd", "concluid"}
+
+local function readEndText()
+	local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+	local es = playerGui and playerGui:FindFirstChild("EndScreen")
+	if not es then return "" end
+	local parts = {}
+	for _, d in ipairs(es:GetDescendants()) do
+		if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Text ~= "" and isReallyVisible(d) then
+			local t = string.lower(d.Text):gsub("<[^>]+>", "")
+			table.insert(parts, t)
+		end
+	end
+	return table.concat(parts, " | ")
+end
+
+local function hasAny(text, words)
+	for _, w in ipairs(words) do
+		if text:find(w, 1, true) then return true end
+	end
+	return false
+end
+
+local function fmtDur(s)
+	s = math.max(0, math.floor(s or 0))
+	return string.format("%dm%02ds", math.floor(s / 60), s % 60)
+end
+
+-- ---------- GUI ----------
+local HistGui = Instance.new("ScreenGui")
+HistGui.Name = "ChisaHistoryGui"
+HistGui.ResetOnSpawn = false
+pcall(function() HistGui.Parent = game:GetService("CoreGui") end)
+if not HistGui.Parent then HistGui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
+
+local HFrame = Instance.new("Frame")
+HFrame.Name = "HistFrame"
+HFrame.Parent = HistGui
+HFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 35)
+HFrame.BorderSizePixel = 0
+HFrame.Position = UDim2.new(0.78, 0, 0.08, 0)
+HFrame.Size = UDim2.new(0, 260, 0, 280)
+HFrame.Active = true
+HFrame.Draggable = true
+Instance.new("UICorner", HFrame)
+
+local HTitle = Instance.new("TextLabel")
+HTitle.Parent = HFrame
+HTitle.BackgroundTransparency = 1
+HTitle.Position = UDim2.new(0, 8, 0, 2)
+HTitle.Size = UDim2.new(1, -40, 0, 26)
+HTitle.Font = Enum.Font.SourceSansBold
+HTitle.Text = "📊 Histórico de Partidas"
+HTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
+HTitle.TextSize = 15
+HTitle.TextXAlignment = Enum.TextXAlignment.Left
+
+local HMin = Instance.new("TextButton")
+HMin.Parent = HFrame
+HMin.BackgroundColor3 = Color3.fromRGB(60, 60, 80)
+HMin.Position = UDim2.new(1, -28, 0, 4)
+HMin.Size = UDim2.new(0, 22, 0, 22)
+HMin.Font = Enum.Font.SourceSansBold
+HMin.Text = "—"
+HMin.TextColor3 = Color3.fromRGB(255, 255, 255)
+HMin.TextSize = 14
+
+local HBody = Instance.new("Frame")
+HBody.Parent = HFrame
+HBody.BackgroundTransparency = 1
+HBody.Position = UDim2.new(0, 0, 0, 30)
+HBody.Size = UDim2.new(1, 0, 1, -30)
+
+local HCount = Instance.new("TextLabel")
+HCount.Parent = HBody
+HCount.BackgroundTransparency = 1
+HCount.Position = UDim2.new(0, 8, 0, 0)
+HCount.Size = UDim2.new(1, -16, 0, 22)
+HCount.Font = Enum.Font.SourceSansBold
+HCount.Text = ""
+HCount.TextColor3 = Color3.fromRGB(255, 255, 255)
+HCount.TextSize = 14
+HCount.TextXAlignment = Enum.TextXAlignment.Left
+
+local HList = Instance.new("ScrollingFrame")
+HList.Parent = HBody
+HList.BackgroundColor3 = Color3.fromRGB(18, 18, 26)
+HList.BorderSizePixel = 0
+HList.Position = UDim2.new(0, 8, 0, 26)
+HList.Size = UDim2.new(1, -16, 0, 150)
+HList.ScrollBarThickness = 4
+HList.CanvasSize = UDim2.new(0, 0, 0, 0)
+HList.AutomaticCanvasSize = Enum.AutomaticSize.Y
+local HLayout = Instance.new("UIListLayout")
+HLayout.Parent = HList
+HLayout.SortOrder = Enum.SortOrder.LayoutOrder
+HLayout.Padding = UDim.new(0, 2)
+
+local HFooter = Instance.new("TextLabel")
+HFooter.Parent = HBody
+HFooter.BackgroundTransparency = 1
+HFooter.Position = UDim2.new(0, 8, 0, 180)
+HFooter.Size = UDim2.new(1, -16, 0, 30)
+HFooter.Font = Enum.Font.SourceSans
+HFooter.Text = ""
+HFooter.TextColor3 = Color3.fromRGB(170, 170, 190)
+HFooter.TextSize = 11
+HFooter.TextWrapped = true
+HFooter.TextXAlignment = Enum.TextXAlignment.Left
+HFooter.TextYAlignment = Enum.TextYAlignment.Top
+
+local HClear = Instance.new("TextButton")
+HClear.Parent = HBody
+HClear.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+HClear.Position = UDim2.new(0, 8, 0, 214)
+HClear.Size = UDim2.new(0, 90, 0, 22)
+HClear.Font = Enum.Font.SourceSansBold
+HClear.Text = "Limpar"
+HClear.TextColor3 = Color3.fromRGB(255, 255, 255)
+HClear.TextSize = 12
+
+local function refreshHistory()
+	local total = HData.wins + HData.losses
+	local rate = total > 0 and math.floor(HData.wins / total * 100 + 0.5) or 0
+	HCount.Text = string.format(" Vitórias: %d    Derrotas: %d   (%d%%)", HData.wins, HData.losses, rate)
+	HFooter.Text = History.lastRejected and ("Última vitória descartada: " .. History.lastRejected) or ""
+
+	for _, c in ipairs(HList:GetChildren()) do
+		if c:IsA("TextLabel") then c:Destroy() end
+	end
+	local order = 0
+	for i = #HData.log, math.max(1, #HData.log - 24), -1 do
+		local e = HData.log[i]
+		order += 1
+		local l = Instance.new("TextLabel")
+		l.Parent = HList
+		l.LayoutOrder = order
+		l.BackgroundTransparency = 1
+		l.Size = UDim2.new(1, -6, 0, 18)
+		l.Font = Enum.Font.SourceSans
+		l.TextSize = 12
+		l.TextXAlignment = Enum.TextXAlignment.Left
+		l.TextTruncate = Enum.TextTruncate.AtEnd
+		local win = e.kind == "win"
+		l.TextColor3 = win and Color3.fromRGB(100, 255, 150) or Color3.fromRGB(255, 110, 110)
+		l.Text = string.format("%s  %s  (%s)  %s", e.t, win and " VITÓRIA" or " DERROTA", fmtDur(e.dur), e.note or "")
+	end
+end
+
+function History.add(kind, note, dur)
+	table.insert(HData.log, {t = os.date("%H:%M:%S"), kind = kind, dur = dur or (tick() - History.matchStart), note = note})
+	if #HData.log > 50 then table.remove(HData.log, 1) end
+	if kind == "win" then HData.wins += 1 else HData.losses += 1 end
+	refreshHistory()
+end
+
+function History.clear()
+	HData.wins, HData.losses = 0, 0
+	HData.log = {}
+	History.lastRejected = nil
+	refreshHistory()
+end
+
+local histMin = false
+HMin.MouseButton1Click:Connect(function()
+	histMin = not histMin
+	HBody.Visible = not histMin
+	HFrame.Size = histMin and UDim2.new(0, 260, 0, 30) or UDim2.new(0, 260, 0, 280)
+	HMin.Text = histMin and "+" or "—"
+end)
+HClear.MouseButton1Click:Connect(function() History.clear() end)
+refreshHistory()
+
+-- ---------- lógica ----------
+function History.reset(now)
+	History.matchStart = now
+	History.died = false
+	History.logged = false
+	History.endShownAt = nil
+	History.sawRetry = false
+	History.sawNext = false
+	History.aliveAtEnd = false
+	History.defeatText = false
+	History.victoryText = false
+	History.retryClicked = false
+end
+
+function History.onEndShown(retryB, nextB)
+	History.endShownAt = tick()
+	History.sawRetry = retryB ~= nil
+	History.sawNext = nextB ~= nil
+	History.defeatText, History.victoryText = false, false
+	local _, char = getRoot()
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	History.aliveAtEnd = hum ~= nil and hum.Health > 0
+end
+function History.sample(retryB, nextB)
+	if retryB then History.sawRetry = true end
+	if nextB then History.sawNext = true end
+	local txt = readEndText()
+	if txt ~= "" then
+		if hasAny(txt, DEFEAT_WORDS) then History.defeatText = true end
+		if hasAny(txt, VICTORY_WORDS) then History.victoryText = true end
+	end
+end
+
+function History.onEndGone()
+	local now = tick()
+	local shownFor = History.endShownAt and (now - History.endShownAt) or 0
+	local playedFor = History.endShownAt and (History.endShownAt - History.matchStart) or 0
+
+	if not History.logged then
+		if History.defeatText then
+			History.logged = true
+			History.add("loss", "tela final indicou derrota", playedFor)
+		else
+			local why
+			if not History.armed then why = "não vi a partida começar"
+			elseif History.died then why = "morreu na partida"
+			elseif not History.aliveAtEnd then why = "sem HP na tela final"
+			elseif shownFor < History.MIN_END_VISIBLE then why = "tela final instável"
+			elseif playedFor < History.MIN_MATCH then why = "partida curta demais"
+			elseif not (History.sawRetry or History.sawNext) then why = "sem botão de retry/próximo"
+			elseif History.requireConfirm and not (History.victoryText or History.sawNext) then why = "sem texto de vitória/botão Próximo"
+			end
+			if why then
+				History.lastRejected = why
+				refreshHistory()
+			else
+				History.logged = true
+				local note = History.victoryText and "texto de vitória" or (History.sawNext and "botão Próximo" or "sem texto de confirmação")
+				if History.retryClicked then note = note .. " + retry" end
+				History.lastRejected = nil
+				History.add("win", note, playedFor)
+			end
+		end
+	end
+	History.reset(now)
+end
+
+task.spawn(function()
+	while running do
+		task.wait(0.1)
+		if not History.died and not endScreenShown then
+			local _, char = getRoot()
+			local hum = char and char:FindFirstChildOfClass("Humanoid")
+			if hum and hum.Health <= 0 and tick() - History.matchStart > 3 then
+				History.died = true
+				if not History.logged then
+					History.logged = true
+					History.add("loss", "HP chegou a 0")
+				end
+			end
+		end
+	end
+end)
+
 task.spawn(function()
 	while running do
 		task.wait(0.15)
@@ -273,20 +569,25 @@ task.spawn(function()
 
 		local retryB, nextB = getEndButtons()
 		if retryB or nextB then
+			if not endScreenShown then History.onEndShown(retryB, nextB) end
+			History.sample(retryB, nextB)
 			endScreenShown = true
 			endAttempt = endAttempt + 1
 
 			if _G_AutoRetry and retryB then
+				History.retryClicked = true
 				clickGuiButton(retryB, endAttempt)
 			elseif _G_AutoSkip and nextB then
 				clickGuiButton(nextB, endAttempt)
 			end
 		else
 			if endScreenShown then
+				History.onEndGone()
 				endScreenShown = false
 				endAttempt = 0
 				resetRun()
 			end
+			History.armed = true
 		end
 	end
 end)
@@ -629,7 +930,6 @@ MainTab:CreateSlider({
    end,
 })
 
--- (estava faltando: os botões de Teleports chamavam uma função que não existia)
 local function teleportToArea(n)
 	local areaInst = findArea(n)
 	local pos = areaInst and getInstPos(areaInst)
@@ -837,54 +1137,53 @@ CloseDonate.MouseButton1Click:Connect(function()
 	triggerPrank()
 end)
 
--- ============================================================
--- FULL CHISA DUNGEON  (Kill All > Alavanca > Zona da FloodGateMarker > Subir)
--- ============================================================
+
 local DG_LEVER_NAME = "CONS_LEVER"
 
 DG.ZoneRadius = 20
 DG.ZoneHeight = 2
 DG.KillRange = 400
-DG.FarRange = 3000       -- busca longa (só com zona ativa) quando não há inimigo perto
+DG.FarRange = 3000       
 DG.farCache = nil
 DG.LeverReach = 12
-DG.NearLeverRange = 40   -- alavancas nesse raio do boneco SEMPRE entram na lista (mesmo fora do scan)
-DG.LeverRetry = 30       -- alavanca puxada sem confirmação só é tentada de novo depois de X s
+DG.NearLeverRange = 40   
+DG.LeverRetry = 30      
 DG.Grace = 8
 DG.AscentSpeed = 40
 DG.AscentMax = 400
-DG.NoProgress = 6        -- desiste do alvo se o HP não mexer por X s
-DG.MaxFight = 120        -- teto absoluto por alvo (s), mesmo com HP mexendo
+DG.NoProgress = 6  
+DG.MaxFight = 120    
 DG.ascentTries = 0
-DG.AscentTriesMax = 2    -- quantas subidas completas antes de desistir
-DG.lastActivity = 0      -- última vez que fez algo útil (lutar, alavanca, zona)
-DG.IdleBeforeAscent = 6  -- fica PARADO procurando por X s antes de subir
-DG.AscentHold = 4        -- a cada degrau da subida, para X s procurando
-DG.AscentStep = 60       -- altura de cada degrau (studs)
+DG.AscentTriesMax = 2   
+DG.lastActivity = 0      
+DG.IdleBeforeAscent = 10 
+DG.AscentHold = 4        
+DG.AscentStep = 60      
 DG.Click = false
 DG.ClickInterval = 1
 DG.status = "Desligado"
 DG.marker = nil
 DG.markerPos = nil
-DG.markerLever = nil     -- a alavanca que EU puxei pra marcação atual
+DG.markerLever = nil   
 DG.goneAt = nil
 DG.ascent = nil
 DG.ascentPause = 0
-DG.lastStopReason = nil  -- diagnóstico: por que a subida foi interrompida
+DG.lastStopReason = nil  
 DG.lastStopT = 0
 DG.nearT = 0
 DG.progress = 0
 DG.endSeen = false
 DG.doneZones = {}
-DG.doneLevers = setmetatable({}, {__mode = "k"})   -- só alavancas que EU puxei e confirmei
+DG.doneLevers = setmetatable({}, {__mode = "k"})  
 DG.mLever = setmetatable({}, {__mode = "k"})
-DG.sweepDone = setmetatable({}, {__mode = "k"})    -- alavanca -> hora da última tentativa
+DG.sweepDone = setmetatable({}, {__mode = "k"})    
 DG.sweepTries = setmetatable({}, {__mode = "k"})
 DG.leverFail = setmetatable({}, {__mode = "k"})
 DG.pulled = setmetatable({}, {__mode = "k"})
 DG.promptCache = setmetatable({}, {__mode = "k"})
 DG.badEnemy = setmetatable({}, {__mode = "k"})
 DG.badCount = setmetatable({}, {__mode = "k"})
+DG.hurt = setmetatable({}, {__mode = "k"})       
 DG.cache = {levers = {}, t = 0}
 
 local function dgNotify(title, content)
@@ -920,7 +1219,6 @@ local function dgClear(t)
 	for k in pairs(t) do t[k] = nil end
 end
 
--- zera a blacklist temporária (fase concluída / retry / botão)
 local function dgReset()
 	DG.marker = nil
 	DG.markerPos = nil
@@ -939,6 +1237,7 @@ local function dgReset()
 	dgClear(DG.promptCache)
 	dgClear(DG.badEnemy)
 	dgClear(DG.badCount)
+	dgClear(DG.hurt)
 	DG.ascentTries = 0
 	DG.cache.t = 0
 	DG.cache.levers = {}
@@ -946,7 +1245,7 @@ local function dgReset()
 	DG.lastActivity = tick()
 end
 
--- interrompe a subida guardando o MOTIVO (aparece no Status pra facilitar o diagnóstico)
+
 local function dgStopAscent(reason)
 	if DG.ascent then
 		DG.lastStopReason = reason
@@ -955,8 +1254,6 @@ local function dgStopAscent(reason)
 	DG.ascent = nil
 end
 
--- A marcação que define a zona CERTA (some quando o objetivo é concluído).
--- Ignora marcações em cima de zonas já concluídas (blacklist) e prefere a que já estava em uso.
 local function dgFindMarker(fromPos)
 	local w = workspace:FindFirstChild("World")
 	local mo = w and w:FindFirstChild("MapObjects")
@@ -985,7 +1282,6 @@ local function dgFindMarker(fromPos)
 	return best, bestPos
 end
 
--- estou dentro da zona? (raio ao redor da marcação OU dentro do volume dela)
 local function dgInZone(marker, mpos)
 	local root = dgAlive()
 	if not root then return false end
@@ -1014,7 +1310,7 @@ local function dgReturnToZone(marker, mpos, stand)
 	return false
 end
 
--- ---------------- alavancas ----------------
+
 local function dgCollectLevers(base, out)
 	for _, d in ipairs(base:GetDescendants()) do
 		if d.Name == DG_LEVER_NAME and not d:FindFirstAncestor(DG_LEVER_NAME) then
@@ -1023,8 +1319,7 @@ local function dgCollectLevers(base, out)
 	end
 end
 
--- Varre o World INTEIRO (Map + MapObjects...) atrás das CONS_LEVER.
--- (antes só olhava o Map e ignorava alavancas de outras pastas)
+
 local function dgRefresh(force)
 	local now = tick()
 	local stale = #DG.cache.levers == 0
@@ -1043,7 +1338,7 @@ local function dgRefresh(force)
 		DG.cache.wideT = now
 		dgCollectLevers(workspace, levers)
 	end
-	-- fallback: o índice 339, caso o scan por nome não ache nada
+
 	if #levers == 0 then
 		local map = getMapFolder()
 		local c = map and map:GetChildren()[339]
@@ -1055,7 +1350,7 @@ local function dgRefresh(force)
 	DG.cache.levers = levers
 end
 
--- acha CONS_LEVER pelas partes ao redor de um ponto (independe do scan geral)
+
 local function dgLeversNear(pos, radius)
 	local out, seen = {}, {}
 	local _, char = getRoot()
@@ -1115,7 +1410,7 @@ local function dgPrompt(lever)
 	return p
 end
 
--- por que essa alavanca está sendo ignorada? (nil = pode usar)
+
 local function dgLeverReason(lever)
 	if DG.doneLevers[lever] then return "na blacklist (já puxada)" end
 	local p = dgPrompt(lever)
@@ -1126,7 +1421,7 @@ local function dgLeverReason(lever)
 	return nil
 end
 
--- alavanca ainda utilizável pra marcação? (fora da blacklist e com prompt ligado)
+
 local function dgLeverUsable(lever)
 	if DG.doneLevers[lever] then return false end
 	local p = dgPrompt(lever)
@@ -1138,14 +1433,13 @@ local function dgSweepIgnore(lever)
 	return dgLeverReason(lever) ~= nil
 end
 
--- texto de diagnóstico: alavanca mais perto de mim e o motivo de usar/ignorar
+
 local function dgNearLeverInfo(root)
 	local l, d = dgNearest(DG.cache.levers, root.Position)
 	if not l then return "nenhuma CONS_LEVER conhecida" end
 	return string.format("alavanca mais perto: %.0f studs (%s)", d, dgLeverReason(l) or "utilizável")
 end
 
--- "impressão digital" da alavanca: se mudar depois de interagir, a interação funcionou
 local function dgFingerprint(inst, prompt)
 	local out = {}
 	local list = {}
@@ -1330,33 +1624,38 @@ local function dgPlaceAt(enemy, fs)
 end
 
 -- escolhe o inimigo mais perto (qualquer coisa com Humanoid vivo, sem prioridade de boss)
-local function dgScanEnemy(origin, radius, char)
+-- allowBad: se só sobrou alvo "ignorado", devolve ele mesmo assim, mas SÓ se eu já tinha machucado ele
+-- (prova de que é um inimigo real e atacável, ex.: boss que muda de fase)
+local function dgScanEnemy(origin, radius, char, allowBad)
 	local params = OverlapParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
 	params.FilterDescendantsInstances = {char}
 	local parts = workspace:GetPartBoundsInRadius(origin, radius, params)
 	local best, bestDist, seen = nil, math.huge, {}
+	local fb, fbDist = nil, math.huge
 	local now = tick()
 	for _, part in ipairs(parts) do
 		local t, kind = resolveTarget(part, char)
 		if t and kind == "npc" and not seen[t] then
 			seen[t] = true
-			local bad = DG.badEnemy[t]
-			if not (bad and bad > now) then
-				local cf = getPivotCF(t)
-				if cf and isVec3Ok(cf.Position) then
-					local d = (cf.Position - origin).Magnitude
-					if d < bestDist then best, bestDist = t, d end
+			local cf = getPivotCF(t)
+			if cf and isVec3Ok(cf.Position) then
+				local d = (cf.Position - origin).Magnitude
+				local bad = DG.badEnemy[t]
+				if bad and bad > now then
+					if allowBad and DG.hurt[t] and d < fbDist then fb, fbDist = t, d end
+				elseif d < bestDist then
+					best, bestDist = t, d
 				end
 			end
 		end
 	end
-	return best
+	return best or fb
 end
 
--- escolhe o inimigo mais perto; com `wide` (zona ativa) e nada por perto, procura o mapa todo
-local function dgPickEnemy(origin, char, wide)
-	local best = dgScanEnemy(origin, DG.KillRange, char)
+-- escolhe o inimigo mais perto; com `wide` e nada por perto, procura o mapa todo
+local function dgPickEnemy(origin, char, wide, allowBad)
+	local best = dgScanEnemy(origin, DG.KillRange, char, allowBad)
 	if best or not wide then return best end
 
 	local now = tick()
@@ -1364,10 +1663,11 @@ local function dgPickEnemy(origin, char, wide)
 	if c and c.enemy and c.enemy.Parent then
 		local h = c.enemy:FindFirstChildOfClass("Humanoid")
 		local bad = DG.badEnemy[c.enemy]
-		if h and h.Health > 0 and not (bad and bad > now) then return c.enemy end
+		local okBad = not (bad and bad > now) or (allowBad and DG.hurt[c.enemy])
+		if h and h.Health > 0 and okBad then return c.enemy end
 	end
 	if c and now - c.t < 0.75 then return nil end
-	local found = dgScanEnemy(origin, DG.FarRange, char)
+	local found = dgScanEnemy(origin, DG.FarRange, char, allowBad)
 	DG.farCache = {t = now, enemy = found}
 	return found
 end
@@ -1385,12 +1685,13 @@ local function dgGiveUp(enemy, now)
 	DG.badEnemy[enemy] = now + math.min(8 * 2 ^ (n - 1), 120)
 end
 
--- luta até o alvo morrer; desiste só se o HP parar de mexer (alvo imune/inalcançável)
+-- luta até o alvo morrer; sem dano há 3s tenta atacar pelo outro lado; desiste só se o HP parar de mexer
 local function dgFight(enemy)
 	local hum = enemy:FindFirstChildOfClass("Humanoid")
 	if not hum then return "sem humanoid" end
 	local startT = tick()
 	local lastHP, lastChange = hum.Health, startT
+	local flipped = false
 
 	local fs = {dir = Vector3.new(0, 0, 1)}
 	local cf0 = getPivotCF(enemy)
@@ -1407,10 +1708,19 @@ local function dgFight(enemy)
 		if not enemy.Parent or hum.Health <= 0 then return "morto" end
 
 		if math.abs(hum.Health - lastHP) > 0.01 then
+			if hum.Health < lastHP then DG.hurt[enemy] = true end
 			lastHP, lastChange = hum.Health, now
-		elseif now - lastChange > DG.NoProgress then
-			dgGiveUp(enemy, now)
-			return "sem progresso"
+			flipped = false
+		else
+			local idle = now - lastChange
+			if idle > 3 and not flipped then
+				flipped = true
+				fs.dir = -fs.dir
+			end
+			if idle > DG.NoProgress then
+				dgGiveUp(enemy, now)
+				return "sem progresso"
+			end
 		end
 		if now - startT > DG.MaxFight then
 			dgGiveUp(enemy, now)
@@ -1421,8 +1731,9 @@ local function dgFight(enemy)
 		local r2 = dgAlive()
 		if c and r2 then
 			local d = r2.Position - c
-			DG.status = string.format("Lutando [%s] %s | horiz %.1f | alt %+.1f",
-				tostring(_G_Mode), tostring(enemy.Name), Vector3.new(d.X, 0, d.Z).Magnitude, d.Y)
+			DG.status = string.format("Lutando %s | HP %.0f%% | horiz %.1f | alt %+.1f",
+				tostring(enemy.Name), hum.MaxHealth > 0 and (hum.Health / hum.MaxHealth * 100) or 0,
+				Vector3.new(d.X, 0, d.Z).Magnitude, d.Y)
 		end
 		dgAttack(now, 1.0)
 		task.wait(0.05)
@@ -1667,7 +1978,8 @@ local function dgStep()
 	------------------------------------------------------------
 	-- 1) Kill All: qualquer coisa que achar, mata
 	if DG.Kill then
-		local enemy = dgPickEnemy(root.Position, char)
+		local hunting = DG.progress >= 1 or DG.ascent ~= nil or DG.ascentTries > 0
+		local enemy = dgPickEnemy(root.Position, char, hunting, true)
 		if enemy then
 			DG.status = "Kill All: atacando inimigo"
 			local fightRes = dgFight(enemy)
@@ -1906,7 +2218,7 @@ DungeonTab:CreateSlider({
 	Range = {2, 30},
 	Increment = 1,
 	Suffix = "s",
-	CurrentValue = 6,
+	CurrentValue = 10,
 	Flag = "DGIdleBeforeAscent",
 	Callback = function(Value) DG.IdleBeforeAscent = Value end,
 })
@@ -1967,6 +2279,20 @@ DungeonTab:CreateButton({
 		dgReset()
 		dgNotify("Auto Dungeon", "Progresso e blacklist reiniciados.")
 	end,
+})
+
+DungeonTab:CreateSection("Histórico de Partidas")
+
+DungeonTab:CreateToggle({
+	Name = "Vitória: exigir confirmação (texto de vitória ou botão Próximo)",
+	CurrentValue = false,
+	Flag = "HistRequireConfirm",
+	Callback = function(Value) History.requireConfirm = Value end,
+})
+
+DungeonTab:CreateButton({
+	Name = "Limpar histórico",
+	Callback = function() History.clear() end,
 })
 
 track(RunService.Heartbeat:Connect(function()
