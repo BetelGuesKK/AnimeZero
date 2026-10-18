@@ -595,12 +595,14 @@ MainTab:CreateDropdown({
    Flag = "ModeDropdown",
    Callback = function(Option)
       if type(Option) == "table" then Option = Option[1] end
-      if Option == "ORAL (em cima)" then
+      if Option == nil then return end
+      local o = string.lower(tostring(Option))
+      if o:find("cima", 1, true) then
          _G_Mode = "acima"
-      elseif Option == "ANAL (Atrás)" then
-         _G_Mode = "atrás"
-      elseif Option == "VAGINAL (Abaixo)" then
+      elseif o:find("abaixo", 1, true) then
          _G_Mode = "abaixo"
+      else
+         _G_Mode = "atrás"
       end
    end,
 })
@@ -626,6 +628,17 @@ MainTab:CreateSlider({
       _G_WaveDelay = Value
    end,
 })
+
+-- (estava faltando: os botões de Teleports chamavam uma função que não existia)
+local function teleportToArea(n)
+	local areaInst = findArea(n)
+	local pos = areaInst and getInstPos(areaInst)
+	local root = getRoot()
+	if root and pos and isVec3Ok(pos) then
+		root.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
+		root.AssemblyLinearVelocity = Vector3.zero
+	end
+end
 
 TeleportsTab:CreateSection("Seleção Rápida de Área")
 for i = 1, MAX_AREA do
@@ -825,10 +838,9 @@ CloseDonate.MouseButton1Click:Connect(function()
 end)
 
 -- ============================================================
--- FULL CHISA DUNGEON  (Kill All > Alavanca > Zona da FloodGateMarker > Subir pro Boss)
+-- FULL CHISA DUNGEON  (Kill All > Alavanca > Zona da FloodGateMarker > Subir)
 -- ============================================================
 local DG_LEVER_NAME = "CONS_LEVER"
-local DG_SWEEP_PAUSE = 12
 
 DG.ZoneRadius = 20
 DG.ZoneHeight = 2
@@ -836,15 +848,15 @@ DG.KillRange = 400
 DG.FarRange = 3000       -- busca longa (só com zona ativa) quando não há inimigo perto
 DG.farCache = nil
 DG.LeverReach = 12
-DG.MaxExcursion = 8
+DG.NearLeverRange = 40   -- alavancas nesse raio do boneco SEMPRE entram na lista (mesmo fora do scan)
+DG.LeverRetry = 30       -- alavanca puxada sem confirmação só é tentada de novo depois de X s
 DG.Grace = 8
 DG.AscentSpeed = 40
 DG.AscentMax = 400
 DG.NoProgress = 6        -- desiste do alvo se o HP não mexer por X s
 DG.MaxFight = 120        -- teto absoluto por alvo (s), mesmo com HP mexendo
-DG.AscentTries = 0
+DG.ascentTries = 0
 DG.AscentTriesMax = 2    -- quantas subidas completas antes de desistir
-DG.PostKillPause = 2     -- pausa antes de voltar a subir depois de matar algo
 DG.lastActivity = 0      -- última vez que fez algo útil (lutar, alavanca, zona)
 DG.IdleBeforeAscent = 6  -- fica PARADO procurando por X s antes de subir
 DG.AscentHold = 4        -- a cada degrau da subida, para X s procurando
@@ -854,18 +866,23 @@ DG.ClickInterval = 1
 DG.status = "Desligado"
 DG.marker = nil
 DG.markerPos = nil
+DG.markerLever = nil     -- a alavanca que EU puxei pra marcação atual
 DG.goneAt = nil
-DG.sweepPause = 0
 DG.ascent = nil
 DG.ascentPause = 0
+DG.lastStopReason = nil  -- diagnóstico: por que a subida foi interrompida
+DG.lastStopT = 0
+DG.nearT = 0
 DG.progress = 0
 DG.endSeen = false
 DG.doneZones = {}
-DG.doneLevers = setmetatable({}, {__mode = "k"})
+DG.doneLevers = setmetatable({}, {__mode = "k"})   -- só alavancas que EU puxei e confirmei
 DG.mLever = setmetatable({}, {__mode = "k"})
-DG.sweepDone = setmetatable({}, {__mode = "k"})
+DG.sweepDone = setmetatable({}, {__mode = "k"})    -- alavanca -> hora da última tentativa
 DG.sweepTries = setmetatable({}, {__mode = "k"})
 DG.leverFail = setmetatable({}, {__mode = "k"})
+DG.pulled = setmetatable({}, {__mode = "k"})
+DG.promptCache = setmetatable({}, {__mode = "k"})
 DG.badEnemy = setmetatable({}, {__mode = "k"})
 DG.badCount = setmetatable({}, {__mode = "k"})
 DG.cache = {levers = {}, t = 0}
@@ -907,8 +924,8 @@ end
 local function dgReset()
 	DG.marker = nil
 	DG.markerPos = nil
+	DG.markerLever = nil
 	DG.goneAt = nil
-	DG.sweepPause = 0
 	DG.ascent = nil
 	DG.ascentPause = 0
 	DG.progress = 0
@@ -918,6 +935,8 @@ local function dgReset()
 	dgClear(DG.sweepDone)
 	dgClear(DG.sweepTries)
 	dgClear(DG.leverFail)
+	dgClear(DG.pulled)
+	dgClear(DG.promptCache)
 	dgClear(DG.badEnemy)
 	dgClear(DG.badCount)
 	DG.ascentTries = 0
@@ -925,6 +944,15 @@ local function dgReset()
 	DG.cache.levers = {}
 	DG.farCache = nil
 	DG.lastActivity = tick()
+end
+
+-- interrompe a subida guardando o MOTIVO (aparece no Status pra facilitar o diagnóstico)
+local function dgStopAscent(reason)
+	if DG.ascent then
+		DG.lastStopReason = reason
+		DG.lastStopT = tick()
+	end
+	DG.ascent = nil
 end
 
 -- A marcação que define a zona CERTA (some quando o objetivo é concluído).
@@ -986,7 +1014,7 @@ local function dgReturnToZone(marker, mpos, stand)
 	return false
 end
 
--- Varre o mapa procurando TODAS as CONS_LEVER (por nome, sem depender de índice)
+-- ---------------- alavancas ----------------
 local function dgCollectLevers(base, out)
 	for _, d in ipairs(base:GetDescendants()) do
 		if d.Name == DG_LEVER_NAME and not d:FindFirstAncestor(DG_LEVER_NAME) then
@@ -995,33 +1023,29 @@ local function dgCollectLevers(base, out)
 	end
 end
 
+-- Varre o World INTEIRO (Map + MapObjects...) atrás das CONS_LEVER.
+-- (antes só olhava o Map e ignorava alavancas de outras pastas)
 local function dgRefresh(force)
 	local now = tick()
-	-- cache vazio ou com alavanca destruída (mapa novo / nova run): reescaneia logo
 	local stale = #DG.cache.levers == 0
 	if not stale then
 		for _, l in ipairs(DG.cache.levers) do
 			if not (l.Parent and l:IsDescendantOf(workspace)) then stale = true break end
 		end
 	end
-	if not force and now - DG.cache.t < (stale and 1.5 or (DG.ascent and 2 or 8)) then return end
+	if not force and now - DG.cache.t < (stale and 1.5 or (DG.ascent and 5 or 8)) then return end
 	DG.cache.t = now
 
 	local levers = {}
-	local map = getMapFolder()
-	if map then dgCollectLevers(map, levers) end
-	-- não achou no Map: procura no World inteiro (MapObjects etc.)
-	if #levers == 0 then
-		local world = workspace:FindFirstChild("World")
-		if world then dgCollectLevers(world, levers) end
-	end
-	-- último recurso: workspace todo (pesado, então no máx. a cada 10s)
-	if #levers == 0 and now - (DG.cache.wideT or 0) >= 10 then
+	local base = workspace:FindFirstChild("World") or workspace
+	dgCollectLevers(base, levers)
+	if #levers == 0 and base ~= workspace and now - (DG.cache.wideT or 0) >= 10 then
 		DG.cache.wideT = now
 		dgCollectLevers(workspace, levers)
 	end
 	-- fallback: o índice 339, caso o scan por nome não ache nada
 	if #levers == 0 then
+		local map = getMapFolder()
 		local c = map and map:GetChildren()[339]
 		if c then
 			local inner = (c.Name == DG_LEVER_NAME) and c or c:FindFirstChild(DG_LEVER_NAME, true)
@@ -1029,6 +1053,39 @@ local function dgRefresh(force)
 		end
 	end
 	DG.cache.levers = levers
+end
+
+-- acha CONS_LEVER pelas partes ao redor de um ponto (independe do scan geral)
+local function dgLeversNear(pos, radius)
+	local out, seen = {}, {}
+	local _, char = getRoot()
+	local params = OverlapParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = {char}
+	local ok, parts = pcall(function()
+		return workspace:GetPartBoundsInRadius(pos, radius, params)
+	end)
+	if not ok or not parts then return out end
+	for _, part in ipairs(parts) do
+		local node = part
+		while node and node ~= workspace do
+			if node.Name == DG_LEVER_NAME then
+				local top = node
+				local up = node.Parent
+				while up and up ~= workspace do
+					if up.Name == DG_LEVER_NAME then top = up end
+					up = up.Parent
+				end
+				if not seen[top] then
+					seen[top] = true
+					table.insert(out, top)
+				end
+				break
+			end
+			node = node.Parent
+		end
+	end
+	return out
 end
 
 local function dgNearest(list, pos, ignore)
@@ -1046,11 +1103,30 @@ local function dgNearest(list, pos, ignore)
 end
 
 local function dgPrompt(lever)
-	if lever:IsA("ProximityPrompt") then return lever end
-	return lever:FindFirstChildWhichIsA("ProximityPrompt", true)
+	local c = DG.promptCache[lever]
+	if c and c.Parent then return c end
+	local p
+	if lever:IsA("ProximityPrompt") then
+		p = lever
+	else
+		p = lever:FindFirstChildWhichIsA("ProximityPrompt", true)
+	end
+	if p then DG.promptCache[lever] = p end
+	return p
 end
 
--- alavanca ainda utilizável? (fora da blacklist e com prompt ligado)
+-- por que essa alavanca está sendo ignorada? (nil = pode usar)
+local function dgLeverReason(lever)
+	if DG.doneLevers[lever] then return "na blacklist (já puxada)" end
+	local p = dgPrompt(lever)
+	if p and p.Parent and not p.Enabled then return "prompt desligado" end
+	local t = DG.sweepDone[lever]
+	if t and tick() - t < DG.LeverRetry then return "tentada há pouco" end
+	if (DG.leverFail[lever] or 0) > tick() then return "falhou há pouco" end
+	return nil
+end
+
+-- alavanca ainda utilizável pra marcação? (fora da blacklist e com prompt ligado)
 local function dgLeverUsable(lever)
 	if DG.doneLevers[lever] then return false end
 	local p = dgPrompt(lever)
@@ -1059,7 +1135,14 @@ local function dgLeverUsable(lever)
 end
 
 local function dgSweepIgnore(lever)
-	return DG.sweepDone[lever] or (DG.leverFail[lever] or 0) > tick() or not dgLeverUsable(lever)
+	return dgLeverReason(lever) ~= nil
+end
+
+-- texto de diagnóstico: alavanca mais perto de mim e o motivo de usar/ignorar
+local function dgNearLeverInfo(root)
+	local l, d = dgNearest(DG.cache.levers, root.Position)
+	if not l then return "nenhuma CONS_LEVER conhecida" end
+	return string.format("alavanca mais perto: %.0f studs (%s)", d, dgLeverReason(l) or "utilizável")
 end
 
 -- "impressão digital" da alavanca: se mudar depois de interagir, a interação funcionou
@@ -1243,6 +1326,7 @@ local function dgPlaceAt(enemy, fs)
 	root.CFrame = CFrame.new(pos, center)
 	root.AssemblyLinearVelocity = Vector3.zero
 	root.AssemblyAngularVelocity = Vector3.zero
+	return center
 end
 
 -- escolhe o inimigo mais perto (qualquer coisa com Humanoid vivo, sem prioridade de boss)
@@ -1333,7 +1417,13 @@ local function dgFight(enemy)
 			return "tempo máximo"
 		end
 
-		dgPlaceAt(enemy, fs)
+		local c = dgPlaceAt(enemy, fs)
+		local r2 = dgAlive()
+		if c and r2 then
+			local d = r2.Position - c
+			DG.status = string.format("Lutando [%s] %s | horiz %.1f | alt %+.1f",
+				tostring(_G_Mode), tostring(enemy.Name), Vector3.new(d.X, 0, d.Z).Magnitude, d.Y)
+		end
 		dgAttack(now, 1.0)
 		task.wait(0.05)
 	end
@@ -1352,11 +1442,21 @@ local function dgLeverPending(marker, mpos)
 	return lever
 end
 
+-- texto extra de diagnóstico pro Status
+local function dgDiagText(root)
+	local txt = dgNearLeverInfo(root)
+	if DG.lastStopReason and tick() - DG.lastStopT < 15 then
+		txt = txt .. " | subida parou por: " .. DG.lastStopReason
+	end
+	return txt
+end
+
 -- sobe em DEGRAUS: sobe um pouco, PARA e procura (inimigos/alavancas), sobe mais um pouco...
 -- (limitado: no máximo DG.AscentTriesMax subidas completas; depois para e espera)
 local function dgAscend(root, now)
+	DG.ascentTries = DG.ascentTries or 0
 	if DG.ascentTries >= DG.AscentTriesMax then
-		DG.status = "Subida concluída sem achar nada; parado (reinicie o progresso pra tentar de novo)"
+		DG.status = "Subida concluída sem achar nada; parado | " .. dgDiagText(root)
 		return
 	end
 
@@ -1369,6 +1469,8 @@ local function dgAscend(root, now)
 
 	-- se algo moveu o personagem, retoma de onde ele está (sem voltar pra coluna antiga)
 	if (p - Vector3.new(a.x, a.y, a.z)).Magnitude > 15 then
+		DG.lastStopReason = "personagem foi movido (rebase)"
+		DG.lastStopT = now
 		a.x, a.z, a.y = p.X, p.Z, p.Y
 		a.stageY = p.Y
 		a.holdUntil = nil
@@ -1381,7 +1483,7 @@ local function dgAscend(root, now)
 		root.CFrame = CFrame.new(a.x, a.y, a.z)
 		root.AssemblyLinearVelocity = Vector3.zero
 		root.AssemblyAngularVelocity = Vector3.zero
-		DG.status = string.format("Parado no degrau, procurando (%.0fs)...", a.holdUntil - now)
+		DG.status = string.format("Parado no degrau, procurando (%.0fs) | %s", a.holdUntil - now, dgDiagText(root))
 		return
 	end
 	a.holdUntil = nil
@@ -1411,7 +1513,8 @@ local function dgAscend(root, now)
 	root.CFrame = CFrame.new(a.x, a.y, a.z)
 	root.AssemblyLinearVelocity = Vector3.zero
 	root.AssemblyAngularVelocity = Vector3.zero
-	DG.status = string.format("Subindo (+%.0f/%d studs) tentativa %d/%d", a.y - a.startY, DG.AscentMax, DG.ascentTries + 1, DG.AscentTriesMax)
+	DG.status = string.format("Subindo (+%.0f/%d studs) tentativa %d/%d | %s",
+		a.y - a.startY, DG.AscentMax, DG.ascentTries + 1, DG.AscentTriesMax, dgDiagText(root))
 end
 
 local function dgStep()
@@ -1443,18 +1546,31 @@ local function dgStep()
 		return
 	end
 
-	if DG.Lever then dgRefresh(false) end
-
 	local now = tick()
+
+	if DG.Lever then
+		dgRefresh(false)
+		-- alavancas bem perto do boneco SEMPRE entram na lista, mesmo que o scan geral não tenha pego
+		if now - DG.nearT >= 0.5 then
+			DG.nearT = now
+			local known = {}
+			for _, l in ipairs(DG.cache.levers) do known[l] = true end
+			for _, l in ipairs(dgLeversNear(root.Position, DG.NearLeverRange)) do
+				if not known[l] then table.insert(DG.cache.levers, l) end
+			end
+		end
+	end
+
 	local marker, mpos = dgFindMarker(root.Position)
 
-	-- ciclo de vida da marcação: nova / sumiu (objetivo concluído -> blacklist da zona e da alavanca)
+	-- ciclo de vida da marcação: nova / sumiu (objetivo concluído)
 	if marker then
 		if DG.marker ~= marker then
 			DG.marker = marker
 			DG.goneAt = nil
-			DG.ascent = nil
+			dgStopAscent("nova marcação apareceu")
 			DG.ascentTries = 0
+			DG.markerLever = nil
 			dgClear(DG.sweepDone)
 		end
 		DG.markerPos = mpos
@@ -1464,14 +1580,24 @@ local function dgStep()
 		DG.goneAt = now
 		DG.lastActivity = now
 		dgClear(DG.sweepDone)
-		DG.sweepPause = 0
 		if lastPos then
 			table.insert(DG.doneZones, lastPos)
-			local lever = dgNearest(DG.cache.levers, lastPos)
-			if lever then DG.doneLevers[lever] = true end
+			-- blacklist SÓ da alavanca que eu realmente puxei pra essa marcação
+			local used = DG.markerLever
+			if used then
+				DG.doneLevers[used] = true
+			else
+				-- não puxei nenhuma: só ignora a mais próxima se ela já estiver usada (prompt desligado)
+				local l, d = dgNearest(DG.cache.levers, lastPos)
+				if l and d <= 60 then
+					local pr = dgPrompt(l)
+					if pr and pr.Parent and not pr.Enabled then DG.doneLevers[l] = true end
+				end
+			end
 		end
+		DG.markerLever = nil
 		DG.progress += 1
-		dgNotify("Auto Dungeon", "Objetivo concluído: alavanca e zona na blacklist.")
+		dgNotify("Auto Dungeon", "Objetivo concluído: zona e alavanca na blacklist.")
 	end
 
 	------------------------------------------------------------
@@ -1479,23 +1605,20 @@ local function dgStep()
 	------------------------------------------------------------
 	if marker then
 		DG.lastActivity = now
-		DG.ascent = nil
+		dgStopAscent("marcação ativa")
 		local stand = mpos + Vector3.new(0, DG.ZoneHeight, 0)
 		local lever = DG.Lever and dgLeverPending(marker, mpos) or nil
 
-		-- 1) Kill All (prioridade máxima; boss primeiro) e volta pra zona depois
+		-- 1) Kill All (prioridade máxima) e volta pra zona depois
 		if DG.Kill then
 			local origin = (DG.Doors and not lever) and stand or root.Position
 			local enemy = dgPickEnemy(origin, char, true)
 			if enemy then
 				DG.status = "Kill All: atacando inimigo"
 				local fightRes = dgFight(enemy)
-				if fightRes == "morto" then
-					DG.ascentTries = 0
-					DG.ascent = nil
-				end
+				if fightRes == "morto" then DG.ascentTries = 0 end
 				DG.lastActivity = tick()
-				DG.ascent = nil
+				dgStopAscent("luta")
 				if DG.Doors and not lever and DG.marker then
 					dgReturnToZone(marker, mpos, stand)
 				end
@@ -1516,6 +1639,8 @@ local function dgStep()
 				rec.tries = rec.tries + 1
 				rec.confirmed = confirmed
 				DG.mLever[marker] = rec
+				DG.markerLever = lever
+				DG.pulled[lever] = (DG.pulled[lever] or 0) + 1
 				DG.status = "Alavanca: " .. tostring(note)
 			end
 			return
@@ -1540,18 +1665,15 @@ local function dgStep()
 	------------------------------------------------------------
 	-- B) SEM MARCAÇÃO
 	------------------------------------------------------------
-	-- 1) Kill All (boss primeiro)
+	-- 1) Kill All: qualquer coisa que achar, mata
 	if DG.Kill then
 		local enemy = dgPickEnemy(root.Position, char)
 		if enemy then
 			DG.status = "Kill All: atacando inimigo"
 			local fightRes = dgFight(enemy)
-			if fightRes == "morto" then
-				DG.ascentTries = 0
-				DG.ascent = nil
-			end
+			if fightRes == "morto" then DG.ascentTries = 0 end
 			DG.lastActivity = tick()
-			DG.ascent = nil
+			dgStopAscent("luta")
 			return
 		end
 	end
@@ -1562,56 +1684,49 @@ local function dgStep()
 		return
 	end
 
-	-- 3) não apareceu: alguma alavanca foi ignorada -> varrer só as que NÃO estão na blacklist
-	if DG.Lever and (now >= DG.sweepPause or DG.ascent) then
+	-- 3) qualquer alavanca utilizável (incluindo a que está do lado do boneco) -> puxar
+	if DG.Lever then
 		local lever = dgNearest(DG.cache.levers, root.Position, dgSweepIgnore)
 		if lever then
-			DG.ascent = nil
+			dgStopAscent("indo puxar alavanca")
 			DG.lastActivity = now
-			DG.status = "Sem marcação: indo numa alavanca ignorada"
+			DG.status = "Sem marcação: indo puxar uma alavanca"
 			local res, note, confirmed = dgDoLever(lever)
 			if res ~= "abort" then
-				DG.sweepDone[lever] = true
-				local tries = (DG.sweepTries[lever] or 0) + 1
-				DG.sweepTries[lever] = tries
+				DG.sweepDone[lever] = tick()
 				DG.lastActivity = tick()
-				if confirmed then
-					DG.doneLevers[lever] = true
-					DG.progress += 1
-				elseif tries >= 2 then
-					-- sem confirmação: ignora só por 30s e tenta de novo depois (não é blacklist eterna)
-					DG.leverFail[lever] = tick() + 30
-					DG.sweepTries[lever] = 0
+				if res == "fail" then
+					DG.leverFail[lever] = tick() + 15
+				else
+					DG.pulled[lever] = (DG.pulled[lever] or 0) + 1
+					if confirmed then
+						DG.doneLevers[lever] = true
+						DG.progress += 1
+					else
+						-- sem confirmação: tenta de novo depois de LeverRetry s; depois de 4 vezes desiste
+						local tries = (DG.sweepTries[lever] or 0) + 1
+						DG.sweepTries[lever] = tries
+						if tries >= 4 then DG.doneLevers[lever] = true end
+					end
 				end
-				DG.status = "Varredura: " .. tostring(note)
+				DG.status = "Alavanca: " .. tostring(note)
 			end
 			return
 		end
-		local triedAny = next(DG.sweepDone) ~= nil
-		DG.sweepPause = now + (triedAny and DG_SWEEP_PAUSE or 3)
-		dgClear(DG.sweepDone)
 	end
 
-	-- 4) nada pra fazer (sem inimigo, marcação ou alavanca): subir pro próximo andar pra spawnar os inimigos
-	do
-		local idle = now - DG.lastActivity
-		if not DG.ascent and idle < DG.IdleBeforeAscent then
-			DG.status = string.format("Parado procurando alavancas/inimigos (sobe em %.0fs)", DG.IdleBeforeAscent - idle)
-			return
-		end
-		if now < DG.ascentPause then
-			DG.status = "Aguardando pra tentar subir de novo..."
-			return
-		end
-		dgAscend(root, now)
+	-- 4) nada pra fazer (sem inimigo, marcação ou alavanca): subir pra spawnar os inimigos
+	local idle = now - DG.lastActivity
+	if not DG.ascent and idle < DG.IdleBeforeAscent then
+		DG.status = string.format("Parado procurando alavancas/inimigos (sobe em %.0fs) | %s",
+			DG.IdleBeforeAscent - idle, dgDiagText(root))
 		return
 	end
-
-	if #DG.cache.levers == 0 then
-		DG.status = "Procurando alavancas (CONS_LEVER) no mapa..."
-	else
-		DG.status = string.format("%d alavanca(s) achada(s), nenhuma utilizável agora; tentando de novo...", #DG.cache.levers)
+	if now < DG.ascentPause then
+		DG.status = "Aguardando pra tentar subir de novo... | " .. dgDiagText(root)
+		return
 	end
+	dgAscend(root, now)
 end
 
 task.spawn(function()
@@ -1651,7 +1766,7 @@ task.spawn(function()
 	end
 end)
 
-DungeonTab:CreateSection("Controle (prioridade: Kill All > Alavanca > Zona > Subir pro Boss)")
+DungeonTab:CreateSection("Controle (prioridade: Kill All > Alavanca > Zona > Subir)")
 
 DG.Toggles.Full = DungeonTab:CreateToggle({
 	Name = "FULL CHISA DUNGEON (Lever + Doors + Kill All)",
@@ -1757,7 +1872,7 @@ DungeonTab:CreateSlider({
 })
 
 DungeonTab:CreateSlider({
-	Name = "Velocidade de subida pro Boss (studs/s)",
+	Name = "Velocidade de subida (studs/s)",
 	Range = {10, 120},
 	Increment = 5,
 	Suffix = "studs/s",
@@ -1815,6 +1930,14 @@ DungeonTab:CreateButton({
 			dgRefresh(true)
 			local root = dgAlive()
 			local origin = root and root.Position or Vector3.zero
+			-- junta também as alavancas bem perto do boneco
+			if root then
+				local known = {}
+				for _, l in ipairs(DG.cache.levers) do known[l] = true end
+				for _, l in ipairs(dgLeversNear(origin, DG.NearLeverRange)) do
+					if not known[l] then table.insert(DG.cache.levers, l) end
+				end
+			end
 			local marker, mpos = dgFindMarker(origin)
 			if marker then
 				print(string.format("[AutoDungeon] FloodGateMarker: %s | dist %d", marker:GetFullName(), math.floor((mpos - origin).Magnitude)))
@@ -1823,13 +1946,15 @@ DungeonTab:CreateButton({
 			else
 				print("[AutoDungeon] FloodGateMarker NÃO existe agora (ou está na blacklist)")
 			end
-			print(string.format("[AutoDungeon] %d %s encontradas | %d zonas e %s alavancas na blacklist | progresso %d",
-				#DG.cache.levers, DG_LEVER_NAME, #DG.doneZones, tostring(next(DG.doneLevers) ~= nil), DG.progress))
+			print(string.format("[AutoDungeon] %d %s encontradas | %d zonas na blacklist | progresso %d",
+				#DG.cache.levers, DG_LEVER_NAME, #DG.doneZones, DG.progress))
 			for i, l in ipairs(DG.cache.levers) do
 				local p = dgPos(l)
-				print(string.format("  LEVER %d: %s | dist %s | %s", i, l:GetFullName(),
+				local pr = dgPrompt(l)
+				print(string.format("  LEVER %d: %s | dist %s | %s | prompt: %s", i, l:GetFullName(),
 					p and tostring(math.floor((p - origin).Magnitude)) or "?",
-					DG.doneLevers[l] and "BLACKLIST" or "ativa"))
+					dgLeverReason(l) or "utilizável",
+					pr and (pr.Enabled and "ligado" or "DESLIGADO") or "nenhum"))
 			end
 			dgNotify("Scan concluído", string.format("Marcação: %s | %d alavancas (veja o console F9).", marker and "existe" or "não existe", #DG.cache.levers))
 		end)
@@ -1840,7 +1965,6 @@ DungeonTab:CreateButton({
 	Name = "Reiniciar progresso (limpar blacklist)",
 	Callback = function()
 		dgReset()
-		DG.cache.t = 0
 		dgNotify("Auto Dungeon", "Progresso e blacklist reiniciados.")
 	end,
 })
